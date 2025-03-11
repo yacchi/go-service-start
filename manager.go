@@ -2,8 +2,8 @@ package service_start
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/hashicorp/go-multierror"
 	"os"
 	"os/signal"
 	"sort"
@@ -87,13 +87,13 @@ func (s *ServiceManager) Start(ctx context.Context) (err error) {
 					s.logger.Info("service_start: '%s' stopped", svc.Name())
 				}()
 				if e := svc.Start(ctx); e != nil {
-					err = multierror.Append(err, e)
+					err = errors.Join(err, e)
 				}
 			}(svc)
 			s.wgStop.Add(1)
 		} else {
 			if e := svc.Start(ctx); e != nil {
-				err = multierror.Append(err, e)
+				err = errors.Join(err, e)
 			}
 		}
 	}
@@ -131,7 +131,7 @@ func (s *ServiceManager) Shutdown(ctx context.Context) (err error) {
 		name := svc.Name()
 		s.logger.Info("service_start: shutdown '%s'", name)
 		if e := svc.Shutdown(ctx); e != nil {
-			err = multierror.Append(err, e)
+			err = errors.Join(err, e)
 		}
 	}
 
