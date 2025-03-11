@@ -13,8 +13,11 @@ import (
 
 type container struct {
 	Service
-	priority   int
-	background bool
+	ctx         context.Context
+	cancel      context.CancelCauseFunc
+	priority    int
+	background  bool
+	stopContext bool
 }
 
 type ServiceOption func(c *container)
@@ -28,6 +31,12 @@ func WithPriority(priority int) ServiceOption {
 func WithBackground() ServiceOption {
 	return func(c *container) {
 		c.background = true
+	}
+}
+
+func WithContextShutdown() ServiceOption {
+	return func(c *container) {
+		c.stopContext = true
 	}
 }
 
@@ -79,6 +88,9 @@ func (s *ServiceManager) Start(ctx context.Context) (err error) {
 
 	for _, svc := range s.services {
 		s.logger.Info("service_start: start '%s'", svc.Name())
+		ctx, cancel := context.WithCancelCause(ctx)
+		svc.ctx = ctx
+		svc.cancel = cancel
 
 		if svc.background {
 			go func(svc Service) {
@@ -130,6 +142,9 @@ func (s *ServiceManager) Shutdown(ctx context.Context) (err error) {
 		svc := s.services[i]
 		name := svc.Name()
 		s.logger.Info("service_start: shutdown '%s'", name)
+		if svc.stopContext {
+			svc.cancel(ServiceShutdown)
+		}
 		if e := svc.Shutdown(ctx); e != nil {
 			err = errors.Join(err, e)
 		}

@@ -1,6 +1,9 @@
 package service_start
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 //go:generate stringer -type=ServiceState service_state.go
 
@@ -23,3 +26,5 @@ type Service interface {
 	Start(ctx context.Context) error
 	Shutdown(ctx context.Context) error
 }
+
+var ServiceShutdown = errors.New("service is shutting down")
