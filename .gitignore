@@ -1,2 +1,21 @@
+# IDE
 .idea/
 *.iml
+.vscode/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+/dist/
+
+# Coverage
+coverage.out
+coverage.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local notes (not part of the OSS source tree)
+/plans/
