@@ -41,10 +41,12 @@ func WithContextShutdown() ServiceOption {
 }
 
 type ServiceManager struct {
+	mu       sync.Mutex
 	state    ServiceState
 	wgStop   sync.WaitGroup
 	services []*container
 	logger   Logger
+	bgErrs   []error
 }
 
 type StateManagerOption struct {
@@ -84,27 +86,30 @@ func (s *ServiceManager) AddService(svc Service, opts ...ServiceOption) {
 
 func (s *ServiceManager) Start(ctx context.Context) (err error) {
 	s.wgStop = sync.WaitGroup{}
+	s.bgErrs = nil
 	s.state = ServiceStarting
 
 	for _, svc := range s.services {
 		s.logger.Info("service_start: start '%s'", svc.Name())
-		ctx, cancel := context.WithCancelCause(ctx)
-		svc.ctx = ctx
+		svcCtx, cancel := context.WithCancelCause(ctx)
+		svc.ctx = svcCtx
 		svc.cancel = cancel
 
 		if svc.background {
-			go func(svc Service) {
+			s.wgStop.Add(1)
+			go func(svc *container) {
 				defer func() {
-					s.wgStop.Done()
 					s.logger.Info("service_start: '%s' stopped", svc.Name())
+					s.wgStop.Done()
 				}()
-				if e := svc.Start(ctx); e != nil {
-					err = errors.Join(err, e)
+				if e := svc.Start(svcCtx); e != nil {
+					s.mu.Lock()
+					s.bgErrs = append(s.bgErrs, e)
+					s.mu.Unlock()
 				}
 			}(svc)
-			s.wgStop.Add(1)
 		} else {
-			if e := svc.Start(ctx); e != nil {
+			if e := svc.Start(svcCtx); e != nil {
 				err = errors.Join(err, e)
 			}
 		}
@@ -151,6 +156,13 @@ func (s *ServiceManager) Shutdown(ctx context.Context) (err error) {
 	}
 
 	s.wgStop.Wait()
+
+	s.mu.Lock()
+	for _, e := range s.bgErrs {
+		err = errors.Join(err, e)
+	}
+	s.bgErrs = nil
+	s.mu.Unlock()
 
 	s.state = ServiceExited
 	return
