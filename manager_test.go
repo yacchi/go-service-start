@@ -18,12 +18,12 @@ func (s ServiceA) Name() string {
 }
 
 func (s ServiceA) Start(ctx context.Context) error {
-	time.Sleep(time.Second * 5)
+	time.Sleep(10 * time.Millisecond)
 	return nil
 }
 
 func (s ServiceA) Shutdown(ctx context.Context) error {
-	time.Sleep(time.Second * 5)
+	time.Sleep(10 * time.Millisecond)
 	return nil
 }
 
@@ -63,7 +63,8 @@ func TestManager(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx2, _ := context.WithTimeout(ctx, time.Second*2)
+	ctx2, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
 	if sig, err := m.Wait(ctx2); err != nil {
 		t.Fatal(err)
 	} else {
@@ -91,7 +92,8 @@ func TestNewService(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx2, _ := context.WithTimeout(context.Background(), time.Second)
+	ctx2, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 	if sig, err := m.Wait(ctx2); err != nil {
 		t.Fatal(err)
 	} else {
@@ -212,4 +214,179 @@ func TestStartShutdownRepeated(t *testing.T) {
 			t.Fatalf("iteration %d: Shutdown: %v", i, err)
 		}
 	}
+}
+
+// TestStartErrorCleanup は同期サービスの Start 失敗時、それまでに起動した
+// サービスのみが優先度の逆順で Shutdown され、未起動のサービスの Shutdown は
+// 呼ばれず、状態が ServiceError になることを検証する。
+func TestStartErrorCleanup(t *testing.T) {
+	m := NewStateManager(&StateManagerOption{Logger: NopLogger()})
+
+	var events []string
+	var mu sync.Mutex
+	record := func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, s)
+	}
+
+	// 優先度 30 (最先) → OK
+	m.AddService(NewService("first",
+		func(ctx context.Context) error { record("start:first"); return nil },
+		func(ctx context.Context) error { record("shutdown:first"); return nil },
+	), WithPriority(30))
+
+	// 優先度 20 → 起動失敗
+	startErr := errors.New("boom")
+	m.AddService(NewService("middle",
+		func(ctx context.Context) error { record("start:middle"); return startErr },
+		func(ctx context.Context) error { record("shutdown:middle"); return nil },
+	), WithPriority(20))
+
+	// 優先度 10 → 呼ばれないはず
+	m.AddService(NewService("last",
+		func(ctx context.Context) error { record("start:last"); return nil },
+		func(ctx context.Context) error { record("shutdown:last"); return nil },
+	), WithPriority(10))
+
+	err := m.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected Start error")
+	}
+	if !errors.Is(err, startErr) {
+		t.Errorf("expected start error wrapped, got: %v", err)
+	}
+	if got := m.State(); got != ServiceError {
+		t.Errorf("expected state ServiceError, got %s", got)
+	}
+
+	want := []string{"start:first", "start:middle", "shutdown:first"}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != len(want) {
+		t.Fatalf("events mismatch: got %v want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Errorf("event[%d]: got %q want %q", i, events[i], want[i])
+		}
+	}
+}
+
+// TestShutdownOrderByPriority は優先度の高い順に Start され、Shutdown は
+// 逆順で呼ばれることを検証する。
+func TestShutdownOrderByPriority(t *testing.T) {
+	m := NewStateManager(&StateManagerOption{Logger: NopLogger()})
+
+	var events []string
+	var mu sync.Mutex
+	record := func(s string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, s)
+	}
+
+	mk := func(name string, prio int) {
+		m.AddService(NewService(name,
+			func(ctx context.Context) error { record("start:" + name); return nil },
+			func(ctx context.Context) error { record("shutdown:" + name); return nil },
+		), WithPriority(prio))
+	}
+	mk("low", 1)
+	mk("high", 10)
+	mk("mid", 5)
+
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{
+		"start:high", "start:mid", "start:low",
+		"shutdown:low", "shutdown:mid", "shutdown:high",
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != len(want) {
+		t.Fatalf("got %v want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Errorf("event[%d]: got %q want %q", i, events[i], want[i])
+		}
+	}
+}
+
+// TestStateTransitions は State() が各遷移点で期待値を返すことを検証する。
+func TestStateTransitions(t *testing.T) {
+	m := NewStateManager(&StateManagerOption{Logger: NopLogger()})
+
+	if got := m.State(); got != ServiceExited {
+		t.Errorf("initial: got %s want ServiceExited", got)
+	}
+
+	gate := make(chan struct{})
+	observedDuringStart := make(chan ServiceState, 1)
+	m.AddService(NewService("svc",
+		func(ctx context.Context) error {
+			observedDuringStart <- m.State()
+			<-gate
+			return nil
+		},
+		func(ctx context.Context) error { return nil },
+	))
+
+	go func() {
+		_ = m.Start(context.Background())
+	}()
+	select {
+	case got := <-observedDuringStart:
+		if got != ServiceStarting {
+			t.Errorf("during Start: got %s want ServiceStarting", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("service did not start in time")
+	}
+
+	close(gate)
+	// Start returns → ServiceRunning
+	deadline := time.Now().Add(time.Second)
+	for m.State() != ServiceRunning {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected ServiceRunning, got %s", m.State())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := m.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.State(); got != ServiceExited {
+		t.Errorf("after Shutdown: got %s want ServiceExited", got)
+	}
+}
+
+// TestAddServicePanicsAfterStart は Start 中の AddService が panic することを検証する。
+func TestAddServicePanicsAfterStart(t *testing.T) {
+	m := NewStateManager(&StateManagerOption{Logger: NopLogger()})
+	m.AddService(NewService("svc",
+		func(ctx context.Context) error { return nil },
+		func(ctx context.Context) error { return nil },
+	))
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Shutdown(context.Background())
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when AddService called after Start")
+		}
+	}()
+	m.AddService(NewService("late",
+		func(ctx context.Context) error { return nil },
+		func(ctx context.Context) error { return nil },
+	))
 }
